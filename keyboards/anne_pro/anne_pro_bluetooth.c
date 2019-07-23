@@ -86,17 +86,16 @@ uint32_t layer_state_set_kb(uint32_t state) {
         /* Bluetooth layer turned on */
         lighting_before_bluetooth_layer = anne_pro_lighting_enabled();
         bluetooth_layer_enabled = true;
-        if (!lighting_before_bluetooth_layer) {
-            anne_pro_lighting_on();
-        }
+        anne_pro_lighting_on();
         anne_pro_bluetooth_lighting_update();
     } else if (bluetooth_layer_enabled && (state & (1 << BLUETOOTH_LAYER)) == 0) {
         /* Bluetooth layer turned off */
         bluetooth_layer_enabled = false;
-        if (!lighting_before_bluetooth_layer) {
-            anne_pro_lighting_off();
-        } else {
+
+        if (lighting_before_bluetooth_layer) {
             anne_pro_lighting_mode_last();
+        } else {
+            anne_pro_lighting_mode(APL_MODE_OFF);
         }
     }
 

@@ -51,7 +51,9 @@ static UARTConfig led_uart_cfg = {
 };
 
 /* State of the leds on the keyboard */
-static volatile bool leds_enabled = false;
+static bool leds_awake = false;
+static bool backlight_active = false;
+static bool capslock_active = false;
 
 void anne_pro_lighting_init(void) {
     /* Turn on lighting controller */
@@ -64,6 +66,29 @@ void anne_pro_lighting_init(void) {
     palSetPadMode(GPIOB, 11, PAL_MODE_ALTERNATE(7));
 }
 
+/* Handle state changes of keyboard LEDs (numlock, capslock) */
+void led_set_kb(uint8_t usb_led) {
+    /* Handle CapsLock led */
+    if (IS_LED_ON(usb_led, USB_LED_CAPS_LOCK)) {
+        capslock_active = true;
+        /* Make sure the lighting chip is awake */
+        anne_pro_lighting_on();
+        /* Turn the capslock indicator on */
+        uart_tx_ringbuf_write(&led_uart_ringbuf, 4, "\x09\x02\x0c\x01");
+        uart_tx_ringbuf_start_transmission(&led_uart_ringbuf);
+    } else {
+        /* Turn the capslock indicator off */
+        uart_tx_ringbuf_write(&led_uart_ringbuf, 4, "\x09\x02\x0c\x00");
+        uart_tx_ringbuf_start_transmission(&led_uart_ringbuf);
+        /* Mark capslock as incative, this will automatically sleep the led
+           controller when possible */
+        capslock_active = false;
+    }
+
+    /* Handle any possible user code */
+    led_set_user(usb_led);
+}
+
 /* Buffer for the keystate packet */
 static uint8_t keystate[12] = {9, 10, 7, 0};
 
@@ -72,7 +97,7 @@ void anne_pro_lighting_update_dynamic(keyrecord_t *record) {
     /* Make sure this is actually a keypress event */
     if (IS_NOEVENT(record->event)) return;
     /* Only update dynamic lighting modes when leds are enabled */
-    if (leds_enabled) {
+    if (backlight_active) {
         /* Calculate the position of the key that was pressed */
         uint8_t row = record->event.key.row;
         uint8_t col = record->event.key.col;
@@ -98,85 +123,89 @@ void anne_pro_lighting_update(void) {
     if (!uart_tx_ringbuf_empty(&led_uart_ringbuf)) {
         uart_tx_ringbuf_start_transmission(&led_uart_ringbuf);
     }
+
+    /* Check if there are users of the lighting system, either backlight or capslock indicator */
+    bool user_active = backlight_active || capslock_active;
+    /* If the leds are awake and there are no active users, sleep the lighting controller */
+    if (leds_awake && !user_active) {
+        anne_pro_lighting_off();
+    }
 }
 
 /* Toggle the lighting on/off */
 void anne_pro_lighting_toggle(void) {
-    if (!leds_enabled) {
+    if (!backlight_active) {
         anne_pro_lighting_on();
+        anne_pro_lighting_mode_last();
     } else {
-        anne_pro_lighting_off();
+        anne_pro_lighting_mode(APL_MODE_OFF);
     }
 }
 
 /* Turn the lighting on */
 void anne_pro_lighting_on(void) {
+    if (leds_awake) return;
     /* Wake up the LED controller */
     writePinHigh(C15);
     chThdSleepMilliseconds(50);
-    /* Send turn light on command */
-    uart_tx_ringbuf_write(&led_uart_ringbuf, 3, "\x09\x01\x01");
-    uart_tx_ringbuf_start_transmission(&led_uart_ringbuf);
-    leds_enabled = true;
-    /* Wait for the message to be sent */
-    chThdSleepMilliseconds(10);
+    leds_awake = true;
 }
 
 /* Turn the lighting off */
 void anne_pro_lighting_off(void) {
-    /* Send turn light off command */
-    uart_tx_ringbuf_write(&led_uart_ringbuf, 4, "\x09\x02\x01\x00");
-    uart_tx_ringbuf_start_transmission(&led_uart_ringbuf);
-    leds_enabled = false;
     /* Sleep the LED controller */
     writePinLow(C15);
+    leds_awake = false;
 }
 
-/* Is the lighting enabled? */
+/* Is the backlight enabled? */
 bool anne_pro_lighting_enabled(void) {
-    return leds_enabled;
+    return backlight_active;
 }
 
 /* Select the next effect rate */
 void anne_pro_lighting_rate_next(void) {
-    if (leds_enabled) {
+    if (backlight_active) {
         uart_tx_ringbuf_write(&led_uart_ringbuf, 6, "\x09\x04\x05\x00\x01\x00");
     }
 }
 
 /* Select the next brightness */
 void anne_pro_lighting_brightness_next(void) {
-    if (leds_enabled) {
+    if (backlight_active) {
         uart_tx_ringbuf_write(&led_uart_ringbuf, 6, "\x09\x04\x05\x00\x00\x01");
     }
 }
 
 /* Select the next lighting mode */
 void anne_pro_lighting_mode_next(void) {
-    if (leds_enabled) {
+    if (backlight_active) {
         uart_tx_ringbuf_write(&led_uart_ringbuf, 6, "\x09\x04\x05\x01\x00\x00");
     }
 }
 
 /* Set the lighting mode */
 void anne_pro_lighting_mode(uint8_t mode) {
-    if (leds_enabled) {
+    if (leds_awake) {
         uint8_t buf[] = {9, 2, 1, mode};
         uart_tx_ringbuf_write(&led_uart_ringbuf, 4, buf);
         uart_tx_ringbuf_start_transmission(&led_uart_ringbuf);
+        backlight_active = (mode != 0);
     }
 }
 
 /* Set the lighting mode to the last lighting mode */
 void anne_pro_lighting_mode_last(void) {
-    if (leds_enabled) {
+    if (leds_awake) {
         uart_tx_ringbuf_write(&led_uart_ringbuf, 3, "\x09\x01\x01");
+        uart_tx_ringbuf_start_transmission(&led_uart_ringbuf);
+        backlight_active = true;
     }
 }
 
 /* Set the rate and brightness */
 void anne_pro_lighting_rate_brightness(uint8_t rate, uint8_t brightness) {
-    if (leds_enabled) {
+    if (backlight_active) {
         if (brightness > 10) brightness = 10;
 
         uint8_t buf[] = {9, 4, 2, rate, brightness, 0};
@@ -188,7 +217,10 @@ void anne_pro_lighting_rate_brightness(uint8_t rate, uint8_t brightness) {
 /* Set lighting for individual keys, this takes number of keys and a payload
    that describes which keys and the colors of those keys */
 void anne_pro_lighting_set_keys(uint8_t keys, uint8_t *payload) {
-    uint8_t buf[] = {9, 3 + 5 * keys, 11, 202, keys};
-    uart_tx_ringbuf_write(&led_uart_ringbuf, 5, buf);
-    uart_tx_ringbuf_write(&led_uart_ringbuf, 5 * keys, payload);
+    if (leds_awake) {
+        uint8_t buf[] = {9, 3 + 5 * keys, 11, 202, keys};
+        uart_tx_ringbuf_write(&led_uart_ringbuf, 5, buf);
+        uart_tx_ringbuf_write(&led_uart_ringbuf, 5 * keys, payload);
+        backlight_active = true;
+    }
 }
